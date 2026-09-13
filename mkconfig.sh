@@ -19,6 +19,7 @@ DNS = 1.1.1.1
 PublicKey = GwWj+BkDxhTmCwXQ0diW2yMpoet2xMzH9RuEegp/QGA=
 Endpoint = orion.hugo-klepsch.tech:51820
 AllowedIPs = ${allowed_ips}
+PersistentKeepalive = 25
 EOF
 }
 
