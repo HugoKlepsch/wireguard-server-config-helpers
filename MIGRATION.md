@@ -55,18 +55,81 @@ sudo cp /etc/wireguard/wg0.conf ~/wg0.conf.backup-$(date +%F)
 
 ### 1.2 Check Docker's chain ordering
 
-Docker inserts its jumps at the *head* of `FORWARD`, ahead of ufw's:
+Docker inserts its jumps at the *head* of `FORWARD`, ahead of ufw's. What
+matters is only this: nothing in Docker's chains may issue a verdict for
+traffic that is not on a Docker bridge.
 
 ```bash
 sudo iptables -S DOCKER-USER
 sudo iptables -S DOCKER-FORWARD
+sudo iptables -S DOCKER-CT
+sudo iptables -S DOCKER-INTERNAL
+sudo iptables -S DOCKER-BRIDGE
 ```
 
-`DOCKER-USER` should be a bare `-j RETURN`, and `DOCKER-FORWARD` should
-contain only bridge-scoped jumps. Both fall through for traffic that is not on
-a Docker bridge, which is why ufw's rules still get a say. If either
-terminally accepts unrelated traffic, stop and reassess — the rules below
-would not be reached.
+The exact layout varies by Docker version. On Docker 28 (Ubuntu 22.04 with
+docker-ce) it looks like this:
+
+```
+-N DOCKER-USER
+-N DOCKER-FORWARD
+-A DOCKER-FORWARD -j DOCKER-CT
+-A DOCKER-FORWARD -j DOCKER-INTERNAL
+-A DOCKER-FORWARD -j DOCKER-BRIDGE
+-A DOCKER-FORWARD -i docker0 -j ACCEPT
+-A DOCKER-FORWARD -i br-... -j ACCEPT
+```
+
+Both are fine:
+
+- **An empty `DOCKER-USER` is equivalent to `-j RETURN`.** A user-defined chain
+  that matches nothing falls through to its caller. Older Docker wrote the
+  `RETURN` explicitly. (This is also the chain Docker intends *you* to add
+  rules to, which is why it is empty.)
+- **The `-i docker0` / `-i br-*` rules match on ingress interface**, so VPN
+  traffic arriving on `wg0` never matches them. They let containers talk
+  outbound.
+- **`DOCKER-CT`, `DOCKER-INTERNAL` and `DOCKER-BRIDGE` should be scoped to a
+  Docker bridge** in every rule. An unscoped conntrack `ESTABLISHED` accept is
+  also harmless — it is the same thing ufw does. An unscoped `ACCEPT` or `DROP`
+  on new connections is not: stop and reassess.
+
+Your existing ruleset is the stronger evidence, and needs no interpretation.
+In `sudo iptables -S FORWARD`, ufw's jumps are listed *before* the `PostUp`
+rules appended at the bottom:
+
+```
+-A FORWARD -j DOCKER-USER
+-A FORWARD -j DOCKER-FORWARD
+-A FORWARD -j ufw-before-forward      <- ufw-user-forward is reached from here
+...
+-A FORWARD -i wg0 -j ACCEPT           <- PostUp, last
+-A FORWARD -o wg0 -j ACCEPT
+```
+
+The VPN working today means traffic reaches those bottom two rules, so it
+already traverses every Docker and ufw chain without any of them issuing a
+verdict. `ufw route` rules land in `ufw-user-forward` — strictly *earlier* than
+the rules they replace.
+
+That ordering also shows what each of the two `PostUp` rules is doing:
+`-i wg0 -j ACCEPT` accepts NEW outbound connections from clients (nothing
+earlier does), while `-o wg0 -j ACCEPT` is already redundant because replies
+are accepted by ufw's conntrack rule. That redundancy is why dropping it is
+safe, and dropping it is what closes the IPv6 exposure.
+
+### 1.2b Confirm the conntrack rule
+
+The design below adds no `eth0 -> wg0` rule, relying on ufw to accept replies.
+Verify that rule exists before removing anything:
+
+```bash
+sudo iptables -S ufw-before-forward | head -5
+```
+
+Expect `-A ufw-before-forward -m conntrack --ctstate RELATED,ESTABLISHED -j
+ACCEPT` near the top. If it is missing, stop: removing `-o wg0 -j ACCEPT`
+would break all return traffic.
 
 ### 1.3 Add the rules
 
