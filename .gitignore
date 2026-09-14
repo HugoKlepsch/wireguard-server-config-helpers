@@ -1,0 +1,21 @@
+# Key material must never be committed.
+
+# wgctl's state directory: registry, client private keys, preshared keys and
+# rendered client configs. Lives in the repo, so this is the important one.
+state/
+
+# Your own config, which names your endpoint and subnets.
+wgctl.conf
+
+# Any server key kept beside the script rather than in /etc/wireguard.
+*privatekey*
+*.key
+
+# Legacy mkconfig.sh wrote peer directories straight into the repo.
+*.conf
+private
+public
+psk
+
+__pycache__/
+.idea/

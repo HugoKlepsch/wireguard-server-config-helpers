@@ -1,0 +1,1509 @@
+#!/usr/bin/env python3
+"""wgctl - manage WireGuard peers on a server.
+
+Single file, standard library only, Python 3.6+.
+
+The registry in <state_dir>/peers.json is the source of truth. The running
+interface and /etc/wireguard/<iface>.conf are *derived* from it by `apply`,
+which reconciles both in one idempotent step. Nothing else should edit
+<iface>.conf, and SaveConfig must stay off.
+
+Run `wgctl --help` or `wgctl <command> --help` for usage.
+"""
+
+import argparse
+import configparser
+import datetime
+import errno
+import fcntl
+import ipaddress
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+
+VERSION = "1.0.0"
+REGISTRY_VERSION = 1
+
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
+
+# How the user invoked us, for hint messages: "./wgctl" from a checkout,
+# "wgctl" if it is on PATH. An absolute path is shortened to the basename,
+# since that is what a PATH install looks like to the user.
+_ARG0 = sys.argv[0]
+ME = (_ARG0 if os.sep in _ARG0 and not os.path.isabs(_ARG0)
+      else os.path.basename(_ARG0))
+
+# Files/dirs that are never peers when scanning a legacy directory.
+LEGACY_SKIP = {".git", ".idea", "__pycache__"}
+
+
+class Error(Exception):
+    """Fatal, user-facing error. Printed without a traceback."""
+
+
+# --------------------------------------------------------------------------
+# small helpers
+# --------------------------------------------------------------------------
+
+def now_iso():
+    return datetime.datetime.now().replace(microsecond=0).isoformat()
+
+
+def split_list(value):
+    """Split a comma/whitespace separated config value into a clean list."""
+    if not value:
+        return []
+    parts = re.split(r"[,\s]+", value.strip())
+    return [item.strip() for item in parts if item.strip()]
+
+
+def write_atomic(path, text, mode=0o600):
+    """Write text to path atomically, leaving no partial file behind."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".wgctl-")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def ensure_dir(path, mode=0o700):
+    if not os.path.isdir(path):
+        os.makedirs(path, mode)
+    os.chmod(path, mode)
+
+
+def read_file(path):
+    with open(path) as handle:
+        return handle.read()
+
+
+def redact(text):
+    """Blank out key material so config text is safe to print in a diff."""
+    return re.sub(
+        r"^(\s*(?:PrivateKey|PresharedKey)\s*=\s*).*$",
+        r"\1<redacted>",
+        text,
+        flags=re.MULTILINE,
+    )
+
+
+def run(argv, stdin=None, check=True):
+    """Run a command, returning stdout. Python 3.6 compatible."""
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE if stdin is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            raise Error("command not found: %s" % argv[0])
+        raise
+    out, err = proc.communicate(stdin)
+    if check and proc.returncode != 0:
+        raise Error(
+            "%s failed (exit %d): %s"
+            % (" ".join(argv), proc.returncode, (err or out or "").strip())
+        )
+    return out
+
+
+# --------------------------------------------------------------------------
+# config
+# --------------------------------------------------------------------------
+
+class Profile(object):
+    """A named (routing, DNS) pair used to render client configs."""
+
+    def __init__(self, name, allowed_ips, dns, description=""):
+        self.name = name
+        self.allowed_ips = allowed_ips  # list of str, as written in the config
+        self.dns = dns                  # list of str (IP addresses)
+        self.description = description
+
+    @property
+    def networks(self):
+        return [ipaddress.ip_network(item, strict=False)
+                for item in self.allowed_ips]
+
+
+class Config(object):
+    def __init__(self, path):
+        self.path = path
+        # Relative paths in the config file resolve against its own directory,
+        # so a repo checkout is self-contained and needs no install step.
+        self.base_dir = os.path.dirname(os.path.abspath(path))
+        parser = configparser.ConfigParser(
+            interpolation=configparser.ExtendedInterpolation()
+        )
+        if not parser.read([path]):
+            raise Error("cannot read config file: %s" % path)
+        self.parser = parser
+
+        if not parser.has_section("server"):
+            raise Error("%s has no [server] section" % path)
+        server = parser["server"]
+
+        def required(key):
+            if key not in server or not server[key].strip():
+                raise Error("%s: [server] %s is required" % (path, key))
+            return server[key].strip()
+
+        self.interface = server.get("interface", "wg0").strip()
+        self.endpoint = required("endpoint")
+        self.listen_port = int(server.get("listen_port", "51820"))
+        self.wan_interface = server.get("wan_interface", "eth0").strip()
+
+        self.ipv4_subnet = ipaddress.ip_network(required("ipv4_subnet"))
+        self.ipv4_address = ipaddress.ip_address(required("ipv4_address"))
+        if self.ipv4_address not in self.ipv4_subnet:
+            raise Error(
+                "[server] ipv4_address %s is not inside ipv4_subnet %s"
+                % (self.ipv4_address, self.ipv4_subnet)
+            )
+
+        subnet6 = server.get("ipv6_subnet", "").strip()
+        self.ipv6_subnet = ipaddress.ip_network(subnet6) if subnet6 else None
+
+        # /etc/wireguard holds the server's own identity and the generated
+        # interface config, because wg-quick requires them there. Everything
+        # else defaults to living beside this config file.
+        self.private_key_file = self._resolve(
+            server.get("private_key_file", "/etc/wireguard/privatekey").strip())
+        self.config_file = self._resolve(
+            server.get("config_file",
+                       "/etc/wireguard/%s.conf" % self.interface).strip())
+        self.state_dir = self._resolve(server.get("state_dir", "state").strip())
+
+        mtu = server.get("mtu", "").strip()
+        self.mtu = int(mtu) if mtu else None
+        keepalive = server.get("persistent_keepalive", "25").strip()
+        self.persistent_keepalive = int(keepalive) if keepalive else None
+
+        self.reserved = set()
+        for item in split_list(server.get("reserved_addresses", "")):
+            self.reserved.add(ipaddress.ip_address(item))
+
+        self.profiles = {}
+        for section in parser.sections():
+            if not section.startswith("profile:"):
+                continue
+            name = section.split(":", 1)[1].strip()
+            body = parser[section]
+            self.profiles[name] = Profile(
+                name,
+                split_list(body.get("allowed_ips", "")),
+                split_list(body.get("dns", "")),
+                body.get("description", "").strip(),
+            )
+        if not self.profiles:
+            raise Error("%s defines no [profile:NAME] sections" % path)
+
+        defaults = split_list(
+            parser["defaults"].get("profiles", "")
+            if parser.has_section("defaults")
+            else ""
+        )
+        self.default_profiles = defaults or sorted(self.profiles)
+
+    def _resolve(self, value):
+        """Absolute paths are used as given; relative ones hang off base_dir."""
+        if not value or os.path.isabs(value):
+            return value
+        return os.path.normpath(os.path.join(self.base_dir, value))
+
+    # derived paths -------------------------------------------------------
+
+    @property
+    def registry_file(self):
+        return os.path.join(self.state_dir, "peers.json")
+
+    @property
+    def secrets_dir(self):
+        return os.path.join(self.state_dir, "secrets")
+
+    @property
+    def out_dir(self):
+        return os.path.join(self.state_dir, "out")
+
+    @property
+    def lock_file(self):
+        return os.path.join(self.state_dir, ".lock")
+
+    @property
+    def ipv6_address(self):
+        if not self.ipv6_subnet:
+            return None
+        return ipv6_for_ipv4(self.ipv4_address, self.ipv6_subnet)
+
+    def profile(self, name):
+        if name not in self.profiles:
+            raise Error(
+                "unknown profile %r (known: %s)"
+                % (name, ", ".join(sorted(self.profiles)))
+            )
+        return self.profiles[name]
+
+
+def find_config(explicit=None):
+    """Prefer a config beside the script, so a checkout runs in place.
+
+    realpath() is used so a symlink into PATH still finds the checkout.
+    """
+    if explicit:
+        return explicit
+    here = os.path.dirname(os.path.realpath(__file__))
+    for candidate in (
+        os.environ.get("WGCTL_CONFIG"),
+        os.path.join(here, "wgctl.conf"),
+        os.path.join(os.getcwd(), "wgctl.conf"),
+        "/etc/wgctl/wgctl.conf",
+    ):
+        if candidate and os.path.exists(candidate):
+            return candidate
+    raise Error(
+        "no config file found; run this from a checkout containing "
+        "wgctl.conf (cp wgctl.conf.example wgctl.conf), or pass --config"
+    )
+
+
+# --------------------------------------------------------------------------
+# addressing (pure functions - unit tested)
+# --------------------------------------------------------------------------
+
+def ipv6_for_ipv4(v4, subnet6):
+    """Map an IPv4 host onto an IPv6 host part that *reads* the same.
+
+    10.8.0.22 -> <subnet>::22
+
+    The last IPv4 octet is taken as a literal string and re-read as
+    hexadecimal, so the text after the final colon matches the text after the
+    final dot. It is not an arithmetic conversion (decimal 22 -> 0x22 -> 34),
+    but it keeps addresses legible and every octet 1..254 maps to a distinct
+    host part.
+    """
+    v4 = ipaddress.ip_address(str(v4))
+    last = v4.packed[3]
+    host = int(str(last), 16)
+    return subnet6.network_address + host
+
+
+def allocate_ipv4(subnet4, server_address, used, reserved=()):
+    """Lowest free host address in subnet4, skipping server/used/reserved."""
+    used = {ipaddress.ip_address(str(item)) for item in used}
+    reserved = {ipaddress.ip_address(str(item)) for item in reserved}
+    for host in subnet4.hosts():
+        if host == server_address or host in used or host in reserved:
+            continue
+        return host
+    raise Error("no free addresses left in %s" % subnet4)
+
+
+def validate_profiles(profiles):
+    """Return a list of human-readable problems with the profile definitions.
+
+    The important check: a profile that sets DNS must route that DNS address
+    through the tunnel, otherwise queries silently leave over the local link
+    and the config is not doing what it appears to do.
+    """
+    problems = []
+    for name in sorted(profiles):
+        profile = profiles[name]
+        if not profile.allowed_ips:
+            problems.append("profile %s: allowed_ips is empty" % name)
+            continue
+        try:
+            networks = profile.networks
+        except ValueError as exc:
+            problems.append("profile %s: bad allowed_ips (%s)" % (name, exc))
+            continue
+        for entry in profile.dns:
+            try:
+                address = ipaddress.ip_address(entry)
+            except ValueError:
+                problems.append(
+                    "profile %s: DNS %r is not an IP address (search domains "
+                    "are not supported)" % (name, entry)
+                )
+                continue
+            if not any(address in net for net in networks
+                       if net.version == address.version):
+                problems.append(
+                    "profile %s: DNS %s is not covered by allowed_ips (%s); "
+                    "queries would bypass the tunnel"
+                    % (name, address, ", ".join(profile.allowed_ips))
+                )
+    return problems
+
+
+# --------------------------------------------------------------------------
+# registry
+# --------------------------------------------------------------------------
+
+class Peer(object):
+    def __init__(self, name, data):
+        self.name = name
+        self.public_key = data["public_key"]
+        self.ipv4 = data["ipv4"]
+        self.ipv6 = data.get("ipv6")
+        self.profiles = list(data.get("profiles", []))
+        self.enabled = bool(data.get("enabled", True))
+        self.has_psk = bool(data.get("has_psk", False))
+        self.created = data.get("created", "")
+        self.note = data.get("note", "")
+
+    def to_dict(self):
+        return {
+            "public_key": self.public_key,
+            "ipv4": self.ipv4,
+            "ipv6": self.ipv6,
+            "profiles": self.profiles,
+            "enabled": self.enabled,
+            "has_psk": self.has_psk,
+            "created": self.created,
+            "note": self.note,
+        }
+
+    @property
+    def addresses(self):
+        out = ["%s/32" % self.ipv4]
+        if self.ipv6:
+            out.append("%s/128" % self.ipv6)
+        return out
+
+
+class Registry(object):
+    """peers.json. Public key material only - safe to commit to git."""
+
+    def __init__(self, config):
+        self.config = config
+        self.peers = {}
+        self._load()
+
+    def _load(self):
+        path = self.config.registry_file
+        if not os.path.exists(path):
+            return
+        try:
+            data = json.loads(read_file(path))
+        except ValueError as exc:
+            raise Error("%s is not valid JSON: %s" % (path, exc))
+        version = data.get("version")
+        if version != REGISTRY_VERSION:
+            raise Error(
+                "%s has registry version %r, this wgctl expects %d"
+                % (path, version, REGISTRY_VERSION)
+            )
+        for name, body in data.get("peers", {}).items():
+            self.peers[name] = Peer(name, body)
+
+    def save(self):
+        ensure_dir(self.config.state_dir, 0o700)
+        payload = {
+            "version": REGISTRY_VERSION,
+            "peers": {n: p.to_dict() for n, p in sorted(self.peers.items())},
+        }
+        write_atomic(
+            self.config.registry_file,
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            0o644,
+        )
+
+    # ---------------------------------------------------------------- views
+
+    def get(self, name):
+        if name not in self.peers:
+            raise Error("no such peer: %s" % name)
+        return self.peers[name]
+
+    def sorted_peers(self):
+        return sorted(
+            self.peers.values(), key=lambda p: ipaddress.ip_address(p.ipv4)
+        )
+
+    def enabled_peers(self):
+        return [p for p in self.sorted_peers() if p.enabled]
+
+    def used_ipv4(self):
+        return [p.ipv4 for p in self.peers.values()]
+
+
+# --------------------------------------------------------------------------
+# secrets
+# --------------------------------------------------------------------------
+
+class Secrets(object):
+    """Client private keys and preshared keys. Never commit these."""
+
+    def __init__(self, config):
+        self.config = config
+
+    def dir_for(self, name):
+        return os.path.join(self.config.secrets_dir, name)
+
+    def path(self, name, kind):
+        return os.path.join(self.dir_for(name), kind)
+
+    def store(self, name, kind, value):
+        ensure_dir(self.config.secrets_dir, 0o700)
+        ensure_dir(self.dir_for(name), 0o700)
+        write_atomic(self.path(name, kind), value.strip() + "\n", 0o600)
+
+    def load(self, name, kind, required=True):
+        path = self.path(name, kind)
+        if not os.path.exists(path):
+            if required:
+                raise Error(
+                    "missing %s for peer %s (expected %s)" % (kind, name, path)
+                )
+            return None
+        return read_file(path).strip()
+
+    def has(self, name, kind):
+        return os.path.exists(self.path(name, kind))
+
+    def discard(self, name):
+        directory = self.dir_for(name)
+        if os.path.isdir(directory):
+            shutil.rmtree(directory)
+
+
+# --------------------------------------------------------------------------
+# wireguard interaction
+# --------------------------------------------------------------------------
+
+def wg_genkey():
+    return run(["wg", "genkey"]).strip()
+
+
+def wg_pubkey(private_key):
+    return run(["wg", "pubkey"], stdin=private_key + "\n").strip()
+
+
+def wg_genpsk():
+    return run(["wg", "genpsk"]).strip()
+
+
+def interface_is_up(interface):
+    try:
+        run(["wg", "show", interface, "public-key"])
+        return True
+    except Error:
+        return False
+
+
+def wg_dump(interface):
+    """Parse `wg show <iface> dump` into {public_key: {...}}."""
+    out = run(["wg", "show", interface, "dump"])
+    peers = {}
+    for index, line in enumerate(out.splitlines()):
+        fields = line.split("\t")
+        if index == 0:
+            continue  # interface line
+        if len(fields) < 8:
+            continue
+        peers[fields[0]] = {
+            "preshared_key": fields[1],
+            "endpoint": fields[2],
+            "allowed_ips": fields[3],
+            "latest_handshake": int(fields[4] or 0),
+            "rx": int(fields[5] or 0),
+            "tx": int(fields[6] or 0),
+        }
+    return peers
+
+
+def handshake_age(timestamp):
+    if not timestamp:
+        return "never"
+    delta = int(datetime.datetime.now().timestamp()) - timestamp
+    if delta < 0:
+        delta = 0
+    for size, unit in ((86400, "d"), (3600, "h"), (60, "m")):
+        if delta >= size:
+            return "%d%s ago" % (delta // size, unit)
+    return "%ds ago" % delta
+
+
+# --------------------------------------------------------------------------
+# rendering (pure functions - unit tested)
+# --------------------------------------------------------------------------
+
+def render_server_config(config, peers, server_private_key, psk_lookup=None):
+    """Build the full contents of /etc/wireguard/<iface>.conf.
+
+    Disabled peers are omitted entirely. SaveConfig is deliberately absent
+    (it defaults to off) and there are no PostUp/PostDown rules - firewalling
+    and NAT are owned by ufw. See MIGRATION.md.
+    """
+    addresses = ["%s/%d" % (config.ipv4_address, config.ipv4_subnet.prefixlen)]
+    if config.ipv6_subnet:
+        addresses.append(
+            "%s/%d" % (config.ipv6_address, config.ipv6_subnet.prefixlen)
+        )
+
+    lines = [
+        "# Generated by wgctl %s - do not edit by hand." % VERSION,
+        "# Regenerate with: wgctl apply",
+        "#",
+        "# Peer list comes from the wgctl registry. SaveConfig must stay off,",
+        "# and forwarding/NAT is owned by ufw, not PostUp rules.",
+        "",
+        "[Interface]",
+        "Address = %s" % ", ".join(addresses),
+        "ListenPort = %d" % config.listen_port,
+        "PrivateKey = %s" % server_private_key,
+    ]
+    if config.mtu:
+        lines.append("MTU = %d" % config.mtu)
+
+    for peer in peers:
+        lines.extend(["", "# peer: %s" % peer.name, "[Peer]"])
+        lines.append("PublicKey = %s" % peer.public_key)
+        psk = psk_lookup(peer.name) if (psk_lookup and peer.has_psk) else None
+        if psk:
+            lines.append("PresharedKey = %s" % psk)
+        lines.append("AllowedIPs = %s" % ", ".join(peer.addresses))
+
+    return "\n".join(lines) + "\n"
+
+
+def render_client_config(config, peer, profile, private_key,
+                         server_public_key, psk=None):
+    """Build one client .conf for a peer/profile pair."""
+    lines = [
+        "# %s - profile %s (generated by wgctl %s)"
+        % (peer.name, profile.name, VERSION),
+    ]
+    if profile.description:
+        lines.append("# %s" % profile.description)
+    lines.extend([
+        "",
+        "[Interface]",
+        "Address = %s" % ", ".join(peer.addresses),
+        "PrivateKey = %s" % private_key,
+    ])
+    if profile.dns:
+        lines.append("DNS = %s" % ", ".join(profile.dns))
+    if config.mtu:
+        lines.append("MTU = %d" % config.mtu)
+
+    lines.extend([
+        "",
+        "[Peer]",
+        "PublicKey = %s" % server_public_key,
+    ])
+    if psk:
+        lines.append("PresharedKey = %s" % psk)
+    lines.append("Endpoint = %s:%d" % (config.endpoint, config.listen_port))
+    lines.append("AllowedIPs = %s" % ", ".join(profile.allowed_ips))
+    if config.persistent_keepalive:
+        lines.append("PersistentKeepalive = %d" % config.persistent_keepalive)
+
+    return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------
+# application object
+# --------------------------------------------------------------------------
+
+class App(object):
+    def __init__(self, config):
+        self.config = config
+        self.secrets = Secrets(config)
+        self.registry = Registry(config)
+        self._lock_handle = None
+
+    # -------------------------------------------------------------- locking
+
+    def lock(self):
+        """Serialise mutating commands so two runs cannot race the registry."""
+        try:
+            ensure_dir(self.config.state_dir, 0o700)
+        except OSError as exc:
+            raise Error(
+                "cannot create state dir %s (%s). Run with sudo?"
+                % (self.config.state_dir, exc.strerror)
+            )
+        self._lock_handle = open(self.config.lock_file, "w")
+        try:
+            fcntl.flock(self._lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except IOError:
+            raise Error(
+                "another wgctl is running (lock: %s)" % self.config.lock_file)
+        # The registry was read before the lock existed; re-read it now that we
+        # hold it, so a concurrent run's writes cannot be clobbered.
+        self.registry = Registry(self.config)
+
+    # ---------------------------------------------------------- server keys
+
+    def server_private_key(self):
+        path = self.config.private_key_file
+        if not os.path.exists(path):
+            raise Error(
+                "server private key not found at %s. Create one with:\n"
+                "  umask 077 && wg genkey > %s" % (path, path)
+            )
+        key = read_file(path).strip()
+        if not key:
+            raise Error("%s is empty" % path)
+        return key
+
+    def server_public_key(self):
+        return wg_pubkey(self.server_private_key())
+
+    # ------------------------------------------------------------ rendering
+
+    def render_peer(self, peer, quiet=False):
+        """Write every profile config for one peer. No rekeying."""
+        private_key = self.secrets.load(peer.name, "private")
+        psk = self.secrets.load(peer.name, "psk", required=False)
+        server_public = self.server_public_key()
+
+        directory = os.path.join(self.config.out_dir, peer.name)
+        ensure_dir(self.config.out_dir, 0o700)
+        ensure_dir(directory, 0o700)
+
+        written = []
+        for profile_name in peer.profiles:
+            profile = self.config.profile(profile_name)
+            text = render_client_config(
+                self.config, peer, profile, private_key, server_public, psk
+            )
+            path = os.path.join(
+                directory, "%s-%s.conf" % (peer.name, profile_name)
+            )
+            write_atomic(path, text, 0o600)
+            written.append(path)
+        if not quiet:
+            print("rendered %d config(s) for %s in %s"
+                  % (len(written), peer.name, directory))
+        return written
+
+    # --------------------------------------------------------------- apply
+
+    def build_server_config(self):
+        return render_server_config(
+            self.config,
+            self.registry.enabled_peers(),
+            self.server_private_key(),
+            lambda name: self.secrets.load(name, "psk", required=False),
+        )
+
+    def apply(self, dry_run=False):
+        new_text = self.build_server_config()
+        path = self.config.config_file
+        old_text = read_file(path) if os.path.exists(path) else ""
+
+        self._print_peer_diff(old_text, new_text)
+
+        if old_text == new_text:
+            print("%s is already up to date." % path)
+        elif dry_run:
+            import difflib
+            diff = difflib.unified_diff(
+                redact(old_text).splitlines(),
+                redact(new_text).splitlines(),
+                fromfile="%s (current)" % path,
+                tofile="%s (new)" % path,
+                lineterm="",
+            )
+            body = "\n".join(diff)
+            print(body if body else "(no textual change)")
+        else:
+            if old_text:
+                backup = "%s.bak-%s" % (
+                    path, datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+                )
+                write_atomic(backup, old_text, 0o600)
+                print("backed up %s -> %s" % (path, backup))
+            write_atomic(path, new_text, 0o600)
+            print("wrote %s" % path)
+
+        if dry_run:
+            print("\n(dry run: the interface was not touched)")
+            return
+
+        interface = self.config.interface
+        if not interface_is_up(interface):
+            print(
+                "interface %s is not up; config written but not loaded.\n"
+                "  start it with: systemctl start wg-quick@%s"
+                % (interface, interface)
+            )
+            return
+
+        stripped = run(["wg-quick", "strip", interface])
+        ensure_dir(self.config.state_dir, 0o700)
+        tmp = os.path.join(self.config.state_dir, ".syncconf")
+        write_atomic(tmp, stripped, 0o600)
+        try:
+            run(["wg", "syncconf", interface, tmp])
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        print("reloaded %s (existing sessions preserved; any drift between "
+              "the file and live state is corrected)" % interface)
+
+    def _print_peer_diff(self, old_text, new_text):
+        """Report which peers apply would add or remove, by public key."""
+        def keys(text):
+            found = {}
+            name = None
+            for line in text.splitlines():
+                match = re.match(r"^#\s*peer:\s*(\S+)", line)
+                if match:
+                    name = match.group(1)
+                    continue
+                match = re.match(r"^PublicKey\s*=\s*(\S+)", line)
+                if match:
+                    found[match.group(1)] = name or "?"
+                    name = None
+            return found
+
+        before, after = keys(old_text), keys(new_text)
+        added = {after[k] for k in after if k not in before}
+        removed = {before[k] for k in before if k not in after}
+        # A name in both lists kept its slot but changed key: a rotation.
+        rekeyed = added & removed
+        added -= rekeyed
+        removed -= rekeyed
+        for label, names in (
+            ("peers to add", added),
+            ("peers to remove", removed),
+            ("peers with a new key", rekeyed),
+        ):
+            if names:
+                print("%-21s %s" % (label + ":", ", ".join(sorted(names))))
+        if not added and not removed and not rekeyed:
+            print("peer set unchanged (%d enabled)" % len(after))
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+def check_name(name):
+    if not NAME_RE.match(name):
+        raise Error(
+            "invalid peer name %r: use letters, digits, dot, dash, "
+            "underscore; must start alphanumeric" % name
+        )
+    return name
+
+
+def cmd_add(app, args):
+    app.lock()
+    name = check_name(args.name)
+    if name in app.registry.peers:
+        raise Error("peer %s already exists (use `rotate` to rekey it)" % name)
+
+    config = app.config
+    if args.address:
+        address = ipaddress.ip_address(args.address)
+        if address not in config.ipv4_subnet:
+            raise Error("%s is not inside %s" % (address, config.ipv4_subnet))
+        if str(address) in app.registry.used_ipv4():
+            raise Error("%s is already assigned" % address)
+        if address == config.ipv4_address:
+            raise Error("%s is the server's own address" % address)
+    else:
+        address = allocate_ipv4(
+            config.ipv4_subnet,
+            config.ipv4_address,
+            app.registry.used_ipv4(),
+            config.reserved,
+        )
+
+    profiles = args.profile or config.default_profiles
+    for profile_name in profiles:
+        config.profile(profile_name)  # validate before generating keys
+
+    private_key = wg_genkey()
+    public_key = wg_pubkey(private_key)
+    psk = None if args.no_psk else wg_genpsk()
+
+    address6 = (ipv6_for_ipv4(address, config.ipv6_subnet)
+                if config.ipv6_subnet else None)
+    peer = Peer(name, {
+        "public_key": public_key,
+        "ipv4": str(address),
+        "ipv6": str(address6) if address6 else None,
+        "profiles": list(profiles),
+        "enabled": True,
+        "has_psk": psk is not None,
+        "created": now_iso(),
+        "note": args.note or "",
+    })
+
+    app.secrets.store(name, "private", private_key)
+    if psk:
+        app.secrets.store(name, "psk", psk)
+    app.registry.peers[name] = peer
+    app.registry.save()
+
+    print("added %s at %s%s" % (
+        name, address, " / %s" % address6 if address6 else ""
+    ))
+    app.render_peer(peer)
+    if args.apply:
+        print("")
+        app.apply()
+    else:
+        print("run `%s apply` to load this peer onto the server" % ME)
+
+
+def cmd_list(app, args):
+    peers = app.registry.sorted_peers()
+    if not peers:
+        print("no peers in registry")
+        return
+
+    live = {}
+    if not args.no_live:
+        try:
+            live = wg_dump(app.config.interface)
+        except Error:
+            pass  # interface down or wg unavailable; addresses still listed
+
+    header = ("NAME", "IPV4", "IPV6", "STATE", "PSK", "HANDSHAKE", "PROFILES")
+    rows = []
+    for peer in peers:
+        info = live.get(peer.public_key)
+        rows.append((
+            peer.name,
+            peer.ipv4,
+            peer.ipv6 or "-",
+            "enabled" if peer.enabled else "DISABLED",
+            "yes" if peer.has_psk else "no",
+            handshake_age(info["latest_handshake"]) if info else
+            ("-" if not live else "not loaded"),
+            ",".join(peer.profiles),
+        ))
+
+    widths = [
+        max(len(str(row[i])) for row in [header] + rows)
+        for i in range(len(header))
+    ]
+    fmt = "  ".join("%%-%ds" % w for w in widths)
+    print(fmt % header)
+    for row in rows:
+        print(fmt % row)
+
+    if live:
+        unknown = set(live) - {p.public_key for p in peers}
+        if unknown:
+            print("\nWARNING: %d peer(s) on the interface are not in the "
+                  "registry:" % len(unknown))
+            for key in sorted(unknown):
+                print("  %s  last handshake %s"
+                      % (key, handshake_age(live[key]["latest_handshake"])))
+            print("  `%s apply` would remove them." % ME)
+
+
+def cmd_show(app, args):
+    peer = app.registry.get(args.name)
+    if args.profile:
+        profiles = [args.profile]
+    else:
+        profiles = peer.profiles
+    private_key = app.secrets.load(peer.name, "private")
+    psk = app.secrets.load(peer.name, "psk", required=False)
+    server_public = app.server_public_key()
+    for index, profile_name in enumerate(profiles):
+        profile = app.config.profile(profile_name)
+        if index:
+            print("")
+        print(render_client_config(
+            app.config, peer, profile, private_key, server_public, psk
+        ), end="")
+
+
+def cmd_qr(app, args):
+    if not shutil.which("qrencode"):
+        raise Error("qrencode is not installed (apt install qrencode)")
+    peer = app.registry.get(args.name)
+    profile = app.config.profile(args.profile)
+    text = render_client_config(
+        app.config, peer, profile,
+        app.secrets.load(peer.name, "private"),
+        app.server_public_key(),
+        app.secrets.load(peer.name, "psk", required=False),
+    )
+    sys.stdout.write(run(["qrencode", "-t", "ansiutf8"], stdin=text))
+
+
+def cmd_render(app, args):
+    app.lock()
+    if args.all:
+        peers = app.registry.sorted_peers()
+    elif args.name:
+        peers = [app.registry.get(args.name)]
+    else:
+        raise Error("give a peer name or --all")
+    for peer in peers:
+        if args.profile:
+            for profile_name in args.profile:
+                app.config.profile(profile_name)
+            peer.profiles = list(args.profile)
+        app.render_peer(peer)
+    if args.profile:
+        app.registry.save()
+
+
+def cmd_rotate(app, args):
+    app.lock()
+    peer = app.registry.get(args.name)
+    private_key = wg_genkey()
+    peer.public_key = wg_pubkey(private_key)
+    app.secrets.store(peer.name, "private", private_key)
+    if args.no_psk:
+        psk_path = app.secrets.path(peer.name, "psk")
+        if os.path.exists(psk_path):
+            os.unlink(psk_path)
+        peer.has_psk = False
+    else:
+        app.secrets.store(peer.name, "psk", wg_genpsk())
+        peer.has_psk = True
+    app.registry.save()
+    print("rotated keys for %s (address %s unchanged)"
+          % (peer.name, peer.ipv4))
+    app.render_peer(peer)
+    print("the old config stops working as soon as you apply")
+    if args.apply:
+        print("")
+        app.apply()
+
+
+def _set_enabled(app, args, enabled):
+    app.lock()
+    peer = app.registry.get(args.name)
+    peer.enabled = enabled
+    app.registry.save()
+    print("%s is now %s" % (peer.name, "enabled" if enabled else "disabled"))
+    if args.apply:
+        print("")
+        app.apply()
+    else:
+        print("run `%s apply` to make it take effect" % ME)
+
+
+def cmd_enable(app, args):
+    _set_enabled(app, args, True)
+
+
+def cmd_disable(app, args):
+    _set_enabled(app, args, False)
+
+
+def cmd_rm(app, args):
+    app.lock()
+    peer = app.registry.get(args.name)
+    if not args.yes:
+        try:
+            answer = input("remove peer %s (%s) and its keys? [y/N] "
+                           % (peer.name, peer.ipv4))
+        except EOFError:
+            raise Error("no terminal to confirm on; pass --yes")
+        if answer.strip().lower() not in ("y", "yes"):
+            print("aborted")
+            return
+    del app.registry.peers[peer.name]
+    app.registry.save()
+
+    out = os.path.join(app.config.out_dir, peer.name)
+    if args.keep_secrets:
+        print("kept key material in %s" % app.secrets.dir_for(peer.name))
+    else:
+        app.secrets.discard(peer.name)
+        if os.path.isdir(out):
+            shutil.rmtree(out)
+    print("removed %s from the registry" % peer.name)
+    if args.apply:
+        print("")
+        app.apply()
+    else:
+        print("run `%s apply` to remove it from the server" % ME)
+
+
+def cmd_apply(app, args):
+    if not args.dry_run:
+        app.lock()
+    app.apply(dry_run=args.dry_run)
+
+
+# ---------------------------------------------------------------- import
+
+def _parse_legacy_peer(directory):
+    """Read one legacy mkconfig.sh peer directory.
+
+    Returns (public_key, private_key, ipv4) or None if it is not a peer dir.
+    """
+    public_path = os.path.join(directory, "public")
+    if not os.path.isfile(public_path):
+        return None
+    public_key = read_file(public_path).strip()
+    if not public_key:
+        return None
+
+    private_path = os.path.join(directory, "private")
+    private_key = None
+    if os.path.isfile(private_path):
+        private_key = read_file(private_path).strip()
+
+    address = None
+    server_conf = os.path.join(directory, "server.conf")
+    if os.path.isfile(server_conf):
+        match = re.search(
+            r"^AllowedIPs\s*=\s*([0-9.]+)",
+            read_file(server_conf),
+            re.MULTILINE,
+        )
+        if match:
+            address = match.group(1)
+    if not address:
+        # fall back to the client config's Address line
+        for entry in sorted(os.listdir(directory)):
+            if not entry.endswith(".conf") or entry == "server.conf":
+                continue
+            match = re.search(
+                r"^Address\s*=\s*([0-9.]+)",
+                read_file(os.path.join(directory, entry)),
+                re.MULTILINE,
+            )
+            if match:
+                address = match.group(1)
+                break
+    return {"public_key": public_key, "private_key": private_key,
+            "ipv4": address}
+
+
+def cmd_import(app, args):
+    source = os.path.abspath(args.source)
+    if not os.path.isdir(source):
+        raise Error("not a directory: %s" % source)
+
+    config = app.config
+    found, problems = {}, []
+    for entry in sorted(os.listdir(source)):
+        if entry in LEGACY_SKIP or entry.startswith("."):
+            continue
+        directory = os.path.join(source, entry)
+        if not os.path.isdir(directory):
+            continue
+        parsed = _parse_legacy_peer(directory)
+        if parsed is None:
+            continue
+        name = entry
+        if not NAME_RE.match(name):
+            problems.append("%s: name is not usable as a peer name" % name)
+            continue
+        if not parsed["ipv4"]:
+            problems.append("%s: could not determine an IPv4 address" % name)
+            continue
+        if not parsed["private_key"]:
+            problems.append(
+                "%s: no private key on disk; it must be rotated after import"
+                % name
+            )
+        try:
+            address = ipaddress.ip_address(parsed["ipv4"])
+        except ValueError:
+            problems.append("%s: bad address %r" % (name, parsed["ipv4"]))
+            continue
+        if address not in config.ipv4_subnet:
+            problems.append(
+                "%s: %s is outside %s" % (name, address, config.ipv4_subnet)
+            )
+            continue
+        parsed["ipv4"] = str(address)
+        found[name] = parsed
+
+    # collisions
+    by_address = {}
+    for name, parsed in found.items():
+        by_address.setdefault(parsed["ipv4"], []).append(name)
+    for address, names in sorted(by_address.items()):
+        if len(names) > 1:
+            problems.append(
+                "address %s is claimed by several peers: %s"
+                % (address, ", ".join(sorted(names)))
+            )
+
+    live = {}
+    try:
+        live = wg_dump(config.interface)
+    except Error:
+        print("note: could not read live interface state (%s)\n"
+              % config.interface)
+
+    print("Found %d peer directory(ies) under %s\n" % (len(found), source))
+    header = ("NAME", "IPV4", "IPV6", "PRIVKEY", "LIVE", "HANDSHAKE")
+    rows = []
+    def by_address(name):
+        return ipaddress.ip_address(found[name]["ipv4"])
+
+    for name in sorted(found, key=by_address):
+        parsed = found[name]
+        address6 = (
+            ipv6_for_ipv4(parsed["ipv4"], config.ipv6_subnet)
+            if config.ipv6_subnet else None
+        )
+        info = live.get(parsed["public_key"])
+        rows.append((
+            name,
+            parsed["ipv4"],
+            str(address6) if address6 else "-",
+            "yes" if parsed["private_key"] else "MISSING",
+            "yes" if info else ("no" if live else "?"),
+            handshake_age(info["latest_handshake"]) if info else "-",
+        ))
+    if rows:
+        widths = [max(len(str(r[i])) for r in [header] + rows)
+                  for i in range(len(header))]
+        fmt = "  ".join("%%-%ds" % w for w in widths)
+        print(fmt % header)
+        for row in rows:
+            print(fmt % row)
+
+    known_keys = {p["public_key"] for p in found.values()}
+    orphans = sorted(set(live) - known_keys)
+    if orphans:
+        print("\n%d peer(s) live on %s with no directory here:"
+              % (len(orphans), config.interface))
+        for key in orphans:
+            print("  %s  %s  last handshake %s"
+                  % (key, live[key]["allowed_ips"],
+                     handshake_age(live[key]["latest_handshake"])))
+        print("  These would be dropped by `%s apply`. Add them by hand "
+              "if they matter." % ME)
+
+    if live:
+        by_key = {p["public_key"]: name for name, p in found.items()}
+        missing = sorted(by_key[k] for k in known_keys - set(live))
+        if missing:
+            print("\n%d directory peer(s) are not loaded on %s (harmless if "
+                  "they were removed earlier): %s"
+                  % (len(missing), config.interface, ", ".join(missing)))
+
+    if problems:
+        print("\nProblems:")
+        for problem in problems:
+            print("  - %s" % problem)
+
+    if not args.write:
+        print("\n(dry run) re-run with --write to create the registry")
+        return
+
+    if problems and not args.force:
+        raise Error("refusing to write with the problems above; fix them "
+                    "or pass --force")
+
+    app.lock()
+    for name, parsed in found.items():
+        if name in app.registry.peers and not args.force:
+            print("skipping %s: already in registry" % name)
+            continue
+        if not parsed["private_key"]:
+            print("skipping %s: no private key" % name)
+            continue
+        address6 = (
+            ipv6_for_ipv4(parsed["ipv4"], config.ipv6_subnet)
+            if config.ipv6_subnet else None
+        )
+        peer = Peer(name, {
+            "public_key": parsed["public_key"],
+            "ipv4": parsed["ipv4"],
+            "ipv6": str(address6) if address6 else None,
+            "profiles": list(config.default_profiles),
+            "enabled": True,
+            "has_psk": False,
+            "created": now_iso(),
+            "note": "imported from %s" % source,
+        })
+        app.secrets.store(name, "private", parsed["private_key"])
+        app.registry.peers[name] = peer
+    app.registry.save()
+    print("\nwrote %s with %d peer(s)"
+          % (config.registry_file, len(app.registry.peers)))
+    print("next: `%s render --all`, review, then `%s apply --dry-run`"
+          % (ME, ME))
+
+
+# ------------------------------------------------------------------ check
+
+def cmd_check(app, args):
+    config = app.config
+    errors, warnings = [], []
+
+    errors.extend(validate_profiles(config.profiles))
+
+    for name in config.default_profiles:
+        if name not in config.profiles:
+            errors.append(
+                "[defaults] profiles names unknown profile %r" % name)
+
+    # registry consistency
+    seen = {}
+    for peer in app.registry.peers.values():
+        seen.setdefault(peer.ipv4, []).append(peer.name)
+        for profile_name in peer.profiles:
+            if profile_name not in config.profiles:
+                errors.append(
+                    "peer %s uses unknown profile %r"
+                    % (peer.name, profile_name))
+        if config.ipv6_subnet and peer.ipv6:
+            expected = str(ipv6_for_ipv4(peer.ipv4, config.ipv6_subnet))
+            if peer.ipv6 != expected:
+                warnings.append(
+                    "peer %s has IPv6 %s, expected %s from its IPv4"
+                    % (peer.name, peer.ipv6, expected)
+                )
+        if not app.secrets.has(peer.name, "private"):
+            errors.append("peer %s has no private key on disk" % peer.name)
+        if peer.has_psk and not app.secrets.has(peer.name, "psk"):
+            errors.append("peer %s is marked has_psk but has no psk file"
+                          % peer.name)
+    for address, names in sorted(seen.items()):
+        if len(names) > 1:
+            errors.append("address %s used by: %s"
+                          % (address, ", ".join(sorted(names))))
+
+    # permissions
+    for path in (config.secrets_dir, config.out_dir):
+        if os.path.isdir(path):
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+            if mode & 0o077:
+                warnings.append("%s is mode %o, should be 700" % (path, mode))
+
+    # environment
+    for sysctl, label in (
+        ("net/ipv4/ip_forward", "IPv4 forwarding"),
+        ("net/ipv6/conf/all/forwarding", "IPv6 forwarding"),
+    ):
+        path = "/proc/sys/" + sysctl
+        if config.ipv6_subnet is None and "ipv6" in sysctl:
+            continue
+        if os.path.exists(path):
+            if read_file(path).strip() != "1":
+                errors.append("%s is off (%s)" % (label, path))
+
+    if os.path.exists(config.config_file):
+        text = read_file(config.config_file)
+        if re.search(r"^\s*SaveConfig\s*=\s*true", text,
+                     re.MULTILINE | re.IGNORECASE):
+            errors.append(
+                "%s has SaveConfig = true; it will overwrite wgctl's output"
+                % config.config_file
+            )
+        if re.search(r"^\s*Post(Up|Down)\s*=.*iptables", text, re.MULTILINE):
+            warnings.append(
+                "%s still has iptables PostUp/PostDown rules; ufw should own "
+                "these (see MIGRATION.md)" % config.config_file
+            )
+        if "Generated by wgctl" not in text:
+            warnings.append(
+                "%s was not generated by wgctl; run `%s apply`"
+                % (config.config_file, ME)
+            )
+
+    if shutil.which("ufw"):
+        try:
+            status = run(["ufw", "status"], check=False)
+            if "Status: active" in status:
+                rules = run(["ufw", "show", "added"], check=False)
+                interface = config.interface
+                wan = "route allow in on %s out on %s" % (
+                    interface, config.wan_interface)
+                if wan not in rules:
+                    warnings.append(
+                        "no `ufw route allow in on %s out on %s` rule found; "
+                        "clients may not reach the internet"
+                        % (interface, config.wan_interface)
+                    )
+                p2p = "route allow in on %s out on %s" % (
+                    interface, interface)
+                if p2p not in rules:
+                    warnings.append(
+                        "no `ufw route allow in on %s out on %s` rule found; "
+                        "peer-to-peer traffic (including in-VPN DNS) may fail"
+                        % (interface, interface)
+                    )
+        except Error:
+            pass
+
+    for binary in ("wg", "wg-quick"):
+        if not shutil.which(binary):
+            errors.append("%s is not installed" % binary)
+
+    for line in warnings:
+        print("WARN  %s" % line)
+    for line in errors:
+        print("ERROR %s" % line)
+    if not errors and not warnings:
+        print("all checks passed")
+    return 1 if errors else 0
+
+
+# --------------------------------------------------------------------------
+# entry point
+# --------------------------------------------------------------------------
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="wgctl",
+        description="Manage WireGuard peers from a declarative registry.",
+        epilog="The registry is the source of truth; `apply` reconciles the "
+               "server to it.",
+    )
+    parser.add_argument("--config", help="path to wgctl.conf")
+    parser.add_argument("--version", action="version",
+                        version="wgctl %s" % VERSION)
+    subparsers = parser.add_subparsers(dest="command")
+
+    def add_apply_flag(sub):
+        sub.add_argument("--apply", action="store_true",
+                         help="run `apply` immediately afterwards")
+
+    sub = subparsers.add_parser(
+        "add", help="create a peer (does not touch the server)")
+    sub.add_argument("name")
+    sub.add_argument("--address", help="force an IPv4 address instead of "
+                                       "allocating the lowest free one")
+    sub.add_argument("--profile", action="append",
+                     help="profile to render (repeatable; default: all in "
+                          "[defaults])")
+    sub.add_argument("--no-psk", action="store_true",
+                     help="do not generate a preshared key")
+    sub.add_argument("--note", help="free-text note stored in the registry")
+    add_apply_flag(sub)
+    sub.set_defaults(func=cmd_add)
+
+    sub = subparsers.add_parser("list", help="list peers and live status")
+    sub.add_argument("--no-live", action="store_true",
+                     help="skip querying the interface")
+    sub.set_defaults(func=cmd_list)
+
+    sub = subparsers.add_parser("show", help="print a peer's config to stdout")
+    sub.add_argument("name")
+    sub.add_argument("profile", nargs="?",
+                     help="single profile to print (default: all)")
+    sub.set_defaults(func=cmd_show)
+
+    sub = subparsers.add_parser("qr", help="print a config as a QR code")
+    sub.add_argument("name")
+    sub.add_argument("profile")
+    sub.set_defaults(func=cmd_qr)
+
+    sub = subparsers.add_parser(
+        "render", help="rewrite client configs from stored keys (no rekey)")
+    sub.add_argument("name", nargs="?")
+    sub.add_argument("--all", action="store_true", help="every peer")
+    sub.add_argument("--profile", action="append",
+                     help="replace the peer's profile list with these")
+    sub.set_defaults(func=cmd_render)
+
+    sub = subparsers.add_parser(
+        "rotate", help="issue a new keypair for a peer, keeping its address")
+    sub.add_argument("name")
+    sub.add_argument("--no-psk", action="store_true")
+    add_apply_flag(sub)
+    sub.set_defaults(func=cmd_rotate)
+
+    sub = subparsers.add_parser(
+        "disable", help="keep the peer but drop it from the server")
+    sub.add_argument("name")
+    add_apply_flag(sub)
+    sub.set_defaults(func=cmd_disable)
+
+    sub = subparsers.add_parser("enable", help="undo `disable`")
+    sub.add_argument("name")
+    add_apply_flag(sub)
+    sub.set_defaults(func=cmd_enable)
+
+    sub = subparsers.add_parser("rm", help="delete a peer from the registry")
+    sub.add_argument("name")
+    sub.add_argument("--keep-secrets", action="store_true",
+                     help="leave key material on disk")
+    sub.add_argument("-y", "--yes", action="store_true",
+                     help="do not prompt")
+    add_apply_flag(sub)
+    sub.set_defaults(func=cmd_rm)
+
+    sub = subparsers.add_parser(
+        "apply", help="reconcile the server with the registry")
+    sub.add_argument("-n", "--dry-run", action="store_true",
+                     help="show what would change and exit")
+    sub.set_defaults(func=cmd_apply)
+
+    sub = subparsers.add_parser(
+        "import",
+        help="build the registry from legacy mkconfig.sh directories")
+    sub.add_argument("source", help="directory containing per-peer subdirs")
+    sub.add_argument("--write", action="store_true",
+                     help="actually write the registry (default: dry run)")
+    sub.add_argument("--force", action="store_true",
+                     help="write despite problems / overwrite existing peers")
+    sub.set_defaults(func=cmd_import)
+
+    sub = subparsers.add_parser(
+        "check", help="validate config, registry, and server environment")
+    sub.set_defaults(func=cmd_check)
+
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return 2
+    try:
+        config = Config(find_config(args.config))
+        problems = validate_profiles(config.profiles)
+        if problems and args.func is not cmd_check:
+            raise Error(
+                "profile definitions are invalid:\n  %s\nrun `%s check`"
+                % ("\n  ".join(problems), ME)
+            )
+        app = App(config)
+        return args.func(app, args) or 0
+    except Error as exc:
+        sys.stderr.write("wgctl: %s\n" % exc)
+        return 1
+    except ValueError as exc:
+        # bad address/subnet/port in the config file
+        sys.stderr.write("wgctl: invalid value in configuration: %s\n" % exc)
+        return 1
+    except (IOError, OSError) as exc:
+        message = "wgctl: %s: %s" % (getattr(exc, "filename", "") or "error",
+                                     exc.strerror or exc)
+        if exc.errno in (errno.EACCES, errno.EPERM):
+            message += "\n       this command needs root; try sudo"
+        sys.stderr.write(message + "\n")
+        return 1
+    except KeyboardInterrupt:
+        sys.stderr.write("\ninterrupted\n")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

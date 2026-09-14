@@ -1,0 +1,86 @@
+# wgctl configuration. Copy to wgctl.conf beside the script and edit:
+#
+#   cp wgctl.conf.example wgctl.conf
+#
+# Relative paths below resolve against this file's directory, so a checkout is
+# self-contained. ${server:key} references are substituted, so the subnets are
+# written once.
+
+[server]
+# WireGuard interface name. /etc/wireguard/<interface>.conf is generated.
+interface = wg0
+
+# Hostname clients dial. Must resolve from the public internet.
+endpoint = orion.hugo-klepsch.tech
+listen_port = 51820
+
+# Interface that carries traffic to the internet. Used for the NAT and
+# `ufw route` rules described in MIGRATION.md, and checked by `wgctl check`.
+wan_interface = eth0
+
+# VPN address space and the server's own address within it.
+ipv4_subnet = 10.8.0.0/24
+ipv4_address = 10.8.0.1
+
+# Routed IPv6 prefix delegated to this host (Linode: Network -> add an IPv6
+# range). Leave blank to run IPv4-only. Client IPv6 addresses are derived from
+# their IPv4 address so the text after the last colon matches the text after
+# the last dot: 10.8.0.22 -> 2600:3c03:e000:0315::22
+ipv6_subnet = 2600:3c03:e000:0315::/64
+
+# The server's own private key. Its public key is derived on demand and never
+# stored separately. Lives in /etc/wireguard because that is the server's
+# identity, not per-peer state.
+private_key_file = /etc/wireguard/privatekey
+
+# Generated interface config. wg-quick@wg0 requires this exact path, so it is
+# the one output that cannot live in the repo.
+config_file = /etc/wireguard/wg0.conf
+
+# Registry, client secrets and rendered client configs. Relative, so this is
+# <this repo>/state. Created mode 0700 and owned by root.
+state_dir = state
+
+# Optional. Leave blank for WireGuard's default (1420). Lower it only if you
+# hit the classic symptom: handshakes and SSH work but HTTPS hangs.
+mtu =
+
+# Written into client configs. Keeps NAT mappings alive from behind CGNAT.
+persistent_keepalive = 25
+
+# Addresses the allocator must never hand out (comma separated).
+reserved_addresses =
+
+
+# ---------------------------------------------------------------------------
+# Profiles: a named pairing of routing (allowed_ips) and DNS.
+#
+# Rule enforced by `wgctl check`: if a profile sets DNS, that address must be
+# covered by its own allowed_ips. Otherwise queries leave over the local link
+# and the config is not doing what it looks like it is doing.
+# ---------------------------------------------------------------------------
+
+[profile:full-vpndns]
+description = Everything through the VPN, resolved by the in-VPN DNS server.
+allowed_ips = 0.0.0.0/0, ::/0
+dns = 10.8.0.22
+
+[profile:full-pubdns]
+description = Everything through the VPN, public resolver. Use when the in-VPN DNS server is down.
+allowed_ips = 0.0.0.0/0, ::/0
+dns = 1.1.1.1
+
+[profile:split-vpndns]
+description = Only VPN traffic tunnelled, resolved by the in-VPN DNS server.
+allowed_ips = ${server:ipv4_subnet}, ${server:ipv6_subnet}
+dns = 10.8.0.22
+
+[profile:split-nodns]
+description = Only VPN traffic tunnelled, keep the local resolver.
+allowed_ips = ${server:ipv4_subnet}, ${server:ipv6_subnet}
+dns =
+
+
+[defaults]
+# Profiles rendered by `wgctl add` when --profile is not given.
+profiles = full-vpndns, full-pubdns, split-vpndns, split-nodns
