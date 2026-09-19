@@ -31,6 +31,13 @@ REGISTRY_VERSION = 1
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
 
+# A client config's file name becomes the interface name when it is imported
+# (NetworkManager, wg-quick). The kernel caps that at 15 characters and
+# wg-quick rejects anything outside this character set, so a profile whose
+# name breaks either rule renders a config the client refuses to import.
+IFNAME_MAX = 15
+IFNAME_RE = re.compile(r"^[A-Za-z0-9_=+.-]+$")
+
 # How the user invoked us, for hint messages: "./wgctl" from a checkout,
 # "wgctl" if it is on PATH. An absolute path is shortened to the basename,
 # since that is what a PATH install looks like to the user.
@@ -349,6 +356,23 @@ def validate_profiles(profiles):
                     % (name, address, ", ".join(profile.allowed_ips))
                 )
     return problems
+
+
+def interface_name_problem(name):
+    """Why `name` cannot become an interface name, or None if it can.
+
+    A peer's config is written as <profile>.conf and importers derive the
+    interface name from that file name, so a profile name is bounded by the
+    kernel's limit even though nothing in wgctl itself cares.
+    """
+    if len(name) > IFNAME_MAX:
+        return ("name is %d characters; clients that derive an interface "
+                "name from the file name (NetworkManager, wg-quick) reject "
+                "more than %d" % (len(name), IFNAME_MAX))
+    if not IFNAME_RE.match(name):
+        return ("name has characters wg-quick does not accept in an "
+                "interface name (allowed: A-Z a-z 0-9 _ = + . -)")
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -685,14 +709,28 @@ class App(object):
             text = render_client_config(
                 self.config, peer, profile, private_key, server_public, psk
             )
-            path = os.path.join(
-                directory, "%s-%s.conf" % (peer.name, profile_name)
-            )
+            # Named for the profile alone: the peer's name is already the
+            # directory, and importers derive an interface name from the
+            # file name, which the kernel caps at IFNAME_MAX characters.
+            path = os.path.join(directory, "%s.conf" % profile_name)
             write_atomic(path, text, 0o600)
             written.append(path)
+
+        # Drop configs this peer no longer has a profile for, including the
+        # <peer>-<profile>.conf names written before that rename. Everything
+        # in here is regenerated from the stored keys, so nothing is lost.
+        keep = set(os.path.basename(path) for path in written)
+        stale = [entry for entry in sorted(os.listdir(directory))
+                 if entry.endswith(".conf") and entry not in keep]
+        for entry in stale:
+            os.remove(os.path.join(directory, entry))
+
         if not quiet:
             print("rendered %d config(s) for %s in %s"
                   % (len(written), peer.name, directory))
+            if stale:
+                print("removed %d stale config(s): %s"
+                      % (len(stale), ", ".join(stale)))
         return written
 
     # --------------------------------------------------------------- apply
@@ -1254,6 +1292,13 @@ def cmd_check(app, args):
     errors, warnings = [], []
 
     errors.extend(validate_profiles(config.profiles))
+
+    # Warn rather than error: such a config is valid WireGuard, it just will
+    # not import on a client that names the interface after the file.
+    for name in sorted(config.profiles):
+        problem = interface_name_problem(name)
+        if problem:
+            warnings.append("profile %s: %s" % (name, problem))
 
     for name in config.default_profiles:
         if name not in config.profiles:

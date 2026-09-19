@@ -280,8 +280,9 @@ address such as `2600:3c03:e000:0315::22` on an open port. It must time out.
 ### 2.6 Redistribute
 
 Every client config changes in this migration — peers gain IPv6 addresses, and
-the four profiles replace the old `<name>.conf` / `<name>all.conf` pair. Keys
-are unchanged, so old configs keep working until you are ready.
+the four profiles replace the old `<name>.conf` / `<name>all.conf` pair. They
+land in `state/out/<name>/` as `<profile>.conf`. Keys are unchanged, so old
+configs keep working until you are ready.
 
 ```bash
 sudo ./wgctl qr hugo-iphone full-vpndns

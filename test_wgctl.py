@@ -385,6 +385,76 @@ class TestRendering(unittest.TestCase):
             self.config.profile("nope")
 
 
+class TestInterfaceNameRule(unittest.TestCase):
+    def test_the_shipped_profile_names_are_importable(self):
+        for name in ("full-vpndns", "full-pubdns",
+                     "split-vpndns", "split-nodns"):
+            self.assertIsNone(wgctl.interface_name_problem(name))
+
+    def test_too_long_is_reported(self):
+        problem = wgctl.interface_name_problem("a" * (wgctl.IFNAME_MAX + 1))
+        self.assertIn("16 characters", problem)
+
+    def test_exactly_at_the_limit_is_fine(self):
+        self.assertIsNone(wgctl.interface_name_problem("a" * wgctl.IFNAME_MAX))
+
+    def test_bad_characters_are_reported(self):
+        self.assertIn("wg-quick", wgctl.interface_name_problem("full vpndns"))
+
+
+class TestRenderedFileNames(unittest.TestCase):
+    """The file name becomes the interface name on import, so it is short."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+        self.app = wgctl.App(make_config(self.tmp))
+        self.app.server_public_key = lambda: "SERVER_PUB"
+        self.app.secrets.store("hugo-laptop", "private", "CLIENTPRIV")
+        self.peer = wgctl.Peer("hugo-laptop", {
+            "public_key": "PUB",
+            "ipv4": "10.8.0.5",
+            "ipv6": "2600:3c03:e000:315::5",
+            "profiles": ["full-vpndns", "split-nodns"],
+            "enabled": True,
+            "has_psk": False,
+        })
+        self.dir = os.path.join(self.app.config.out_dir, "hugo-laptop")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def render(self):
+        self.app.render_peer(self.peer, quiet=True)
+        return sorted(os.listdir(self.dir))
+
+    def test_file_is_named_for_the_profile_alone(self):
+        self.assertEqual(self.render(),
+                         ["full-vpndns.conf", "split-nodns.conf"])
+
+    def test_names_fit_an_interface_name(self):
+        for entry in self.render():
+            self.assertLessEqual(len(entry[:-len(".conf")]), wgctl.IFNAME_MAX)
+
+    def test_peer_is_still_named_inside_the_file(self):
+        self.render()
+        self.assertIn("hugo-laptop",
+                      read(os.path.join(self.dir, "full-vpndns.conf")))
+
+    def test_stale_configs_are_removed(self):
+        self.render()
+        stale = os.path.join(self.dir, "hugo-laptop-full-vpndns.conf")
+        with open(stale, "w") as handle:
+            handle.write("old\n")
+        self.assertNotIn("hugo-laptop-full-vpndns.conf", self.render())
+        self.assertFalse(os.path.exists(stale))
+
+    def test_dropping_a_profile_removes_its_config(self):
+        self.render()
+        self.peer.profiles = ["split-nodns"]
+        self.assertEqual(self.render(), ["split-nodns.conf"])
+
+
 class TestRedaction(unittest.TestCase):
     def test_keys_are_hidden_but_structure_kept(self):
         text = textwrap.dedent("""\

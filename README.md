@@ -142,8 +142,13 @@ sudo ./wgctl rotate drake --apply         # new keys, same address
 sudo ./wgctl apply --dry-run              # show pending changes, touch nothing
 ```
 
-Configs land in `state/out/<name>/`. `sudo ./wgctl show <name> [profile]`
-prints one to stdout instead.
+Configs land in `state/out/<name>/<profile>.conf`. `sudo ./wgctl show <name>
+[profile]` prints one to stdout instead. The file is named for the profile
+alone because importers (NetworkManager/KDE, `wg-quick`) turn the file name
+into the interface name, which the kernel caps at 15 characters; the peer's
+name is the directory, and is repeated in a comment inside the file. Rendering
+also deletes configs in that directory that the peer no longer has a profile
+for.
 
 `--apply` is a convenience; without it the registry changes and the server is
 untouched until you run `./wgctl apply`.
@@ -195,6 +200,9 @@ The `*-pubdns` and `*-nodns` variants exist because a `*-vpndns` config has no
 resolver at all when the in-VPN one stops answering, which presents as "the
 internet is broken". Internal names still resolve on the fallback profiles
 because their records live in a public zone.
+
+Keep profile names to 15 characters and to `A-Z a-z 0-9 _ = + . -`, for the
+import reason above; `./wgctl check` warns when one is too long to import.
 
 `wgctl` refuses to start if a profile sets a DNS address its own `AllowedIPs`
 do not route — the silently-wrong combination where queries look tunnelled but
