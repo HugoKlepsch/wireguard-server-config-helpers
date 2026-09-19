@@ -191,11 +191,10 @@ no rekeying.
 | `split-vpndns` | VPN subnets only | in-VPN DNS                       |
 | `split-nodns`  | VPN subnets only | whatever the local network gives |
 
-The `*-pubdns` and `*-nodns` variants exist because the in-VPN resolver is
-itself a peer: if that machine drops off the VPN, a `*-vpndns` config has no
-resolver at all, which presents as "the internet is broken". Internal names
-still resolve on the fallback profiles because their records live in a public
-zone.
+The `*-pubdns` and `*-nodns` variants exist because a `*-vpndns` config has no
+resolver at all when the in-VPN one stops answering, which presents as "the
+internet is broken". Internal names still resolve on the fallback profiles
+because their records live in a public zone.
 
 `wgctl` refuses to start if a profile sets a DNS address its own `AllowedIPs`
 do not route — the silently-wrong combination where queries look tunnelled but
@@ -207,8 +206,9 @@ leave over the local link. Search domains are not supported; use FQDNs.
 covers the usual causes; `sudo ufw show added` should list both `route allow`
 rules. If they are missing, step 3 above was lost.
 
-**No DNS on a `*-vpndns` profile.** The resolver peer is offline. Switch the
-device to `full-pubdns` and check `./wgctl list` for its last handshake.
+**No DNS on a `*-vpndns` profile.** The in-VPN resolver is not answering.
+Switch the device to `full-pubdns`, then from a connected client check the
+resolver itself: `dig @10.8.0.1 immich.hugo-klepsch.tech`.
 
 **SSH works, HTTPS hangs.** MTU. Set `mtu = 1380` in `wgctl.conf`,
 `./wgctl render --all`, redistribute.

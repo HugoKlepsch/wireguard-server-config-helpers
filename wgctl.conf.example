@@ -63,7 +63,7 @@ reserved_addresses =
 [profile:full-vpndns]
 description = Everything through the VPN, resolved by the in-VPN DNS server.
 allowed_ips = 0.0.0.0/0, ::/0
-dns = 10.8.0.22
+dns = 10.8.0.1
 
 [profile:full-pubdns]
 description = Everything through the VPN, public resolver. Use when the in-VPN DNS server is down.
@@ -73,7 +73,7 @@ dns = 1.1.1.1
 [profile:split-vpndns]
 description = Only VPN traffic tunnelled, resolved by the in-VPN DNS server.
 allowed_ips = ${server:ipv4_subnet}, ${server:ipv6_subnet}
-dns = 10.8.0.22
+dns = 10.8.0.1
 
 [profile:split-nodns]
 description = Only VPN traffic tunnelled, keep the local resolver.
