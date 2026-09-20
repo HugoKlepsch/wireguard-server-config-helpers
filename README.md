@@ -156,6 +156,33 @@ untouched until you run `./wgctl apply`.
 Run `./wgctl <command> --help` for options. `sudo ./wgctl check` validates the
 config, registry, permissions, and firewall, and exits non-zero on real errors.
 
+### Importing on Linux (NetworkManager/KDE)
+
+Copy that peer's directory to the device, then import and label in one pass.
+`nmcli` names the connection and the interface after the file, so the readable
+name is set afterwards:
+
+```bash
+while read -r profile label; do
+  sudo nmcli connection delete "$label" 2>/dev/null   # replace a previous import
+  sudo nmcli connection import type wireguard file "$profile.conf" &&
+  sudo nmcli connection modify "$profile" \
+      connection.autoconnect no connection.id "$label"
+done <<'EOF'
+full-vpndns   VPN full / VPN DNS
+full-pubdns   VPN full / public DNS
+split-vpndns  VPN split / VPN DNS
+split-nodns   VPN split / local DNS
+EOF
+```
+
+Rerun it after each `render`; importing again otherwise adds a second
+connection rather than updating the first. `autoconnect no` stops the four
+from competing at boot — activate one from the applet, or with
+`nmcli connection up "VPN full / VPN DNS"`. NetworkManager copies the private
+key into `/etc/NetworkManager/system-connections/`, so delete the `.conf`
+files from the device once the tunnel works.
+
 ### Adding or changing a peer's profiles
 
 ```bash
